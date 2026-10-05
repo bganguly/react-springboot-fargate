@@ -12,32 +12,32 @@ ADMIN_STACK="${ADMIN_STACK:-aws-springboot-admin}"
 FRONTEND_STACK="${FRONTEND_STACK:-aws-springboot-frontend}"
 ECR_REPO="aws-springboot-jobs"
 
-echo "[1/5] Checking AWS credentials..."
-aws sts get-caller-identity >/dev/null 2>&1 || { echo "  Run: aws configure"; exit 1; }
-ACCOUNT_ID="${ACCOUNT_ID:-$(aws sts get-caller-identity --query Account --output text)}"
-printf '  Credentials valid: %s\n' "$(aws sts get-caller-identity --query Arn --output text 2>/dev/null)"
+ACCOUNT_ID=""
+IMAGE_URI=""
+API_HTTPS_URL=""
+ADMIN_API_URL=""
+_GH_REPO=""
+_DEPLOY_TAG=""
 
-_GH_REPO="$(git -C "$ROOT_DIR" remote get-url origin 2>/dev/null \
-  | sed 's|.*github\.com[:/]\(.*\)\.git$|\1|; s|.*github\.com[:/]\(.*\)$|\1|')"
-if command -v gh >/dev/null 2>&1 && [[ -n "$_GH_REPO" ]]; then
-  printf '  Syncing AWS credentials to GitHub Actions secrets (%s)...\n' "$_GH_REPO"
-  aws configure get aws_access_key_id     | gh secret set AWS_ACCESS_KEY_ID     --repo "$_GH_REPO"
-  aws configure get aws_secret_access_key | gh secret set AWS_SECRET_ACCESS_KEY --repo "$_GH_REPO"
-  printf '%s' "$REGION"                   | gh secret set AWS_REGION            --repo "$_GH_REPO"
-fi
+# ── Credentials ───────────────────────────────────────────────────────────────
 
-SITE_BUCKET_NAME="${SITE_BUCKET_NAME:-aws-springboot-frontend-${ACCOUNT_ID}-${REGION}}"
+_check_credentials() {
+  echo "[1/5] Checking AWS credentials..."
+  aws sts get-caller-identity >/dev/null 2>&1 || { echo "  Run: aws configure"; exit 1; }
+  ACCOUNT_ID="${ACCOUNT_ID:-$(aws sts get-caller-identity --query Account --output text)}"
+  printf '  Credentials valid: %s\n' "$(aws sts get-caller-identity --query Arn --output text 2>/dev/null)"
 
-echo ""
-echo "[2/5] Provisioning ECR repository..."
-aws ecr describe-repositories --repository-names "$ECR_REPO" --region "$REGION" >/dev/null 2>&1 || \
-  aws ecr create-repository --repository-name "$ECR_REPO" --region "$REGION" >/dev/null
-printf '  ECR repo ready.\n'
+  _GH_REPO="$(git -C "$ROOT_DIR" remote get-url origin 2>/dev/null \
+    | sed 's|.*github\.com[:/]\(.*\)\.git$|\1|; s|.*github\.com[:/]\(.*\)$|\1|')"
+  if command -v gh >/dev/null 2>&1 && [[ -n "$_GH_REPO" ]]; then
+    printf '  Syncing AWS credentials to GitHub Actions secrets (%s)...\n' "$_GH_REPO"
+    aws configure get aws_access_key_id     | gh secret set AWS_ACCESS_KEY_ID     --repo "$_GH_REPO"
+    aws configure get aws_secret_access_key | gh secret set AWS_SECRET_ACCESS_KEY --repo "$_GH_REPO"
+    printf '%s' "$REGION"                   | gh secret set AWS_REGION            --repo "$_GH_REPO"
+  fi
+}
 
-echo ""
-echo "[3/5] Verifying ECR image..."
-_REMOTE_SHA="$(git -C "$ROOT_DIR" ls-remote origin HEAD 2>/dev/null | cut -c1-7)"
-_DEPLOY_TAG="${_REMOTE_SHA:-$(git -C "$ROOT_DIR" rev-parse --short HEAD 2>/dev/null || echo "latest")}"
+# ── ECR ───────────────────────────────────────────────────────────────────────
 
 _ecr_image_exists() {
   aws ecr describe-images \
@@ -46,46 +46,43 @@ _ecr_image_exists() {
     --region "$REGION" >/dev/null 2>&1
 }
 
-printf '  Checking ECR for image %s...\n' "$_DEPLOY_TAG"
-if ! _ecr_image_exists "$_DEPLOY_TAG"; then
-  printf '  Waiting for GitHub Actions to build image %s (up to 15 min)...\n' "$_DEPLOY_TAG"
-  _ecr_elapsed=0
-  until _ecr_image_exists "$_DEPLOY_TAG"; do
-    if (( _ecr_elapsed >= 900 )); then
-      printf '  Timed out. Check Actions: https://github.com/%s/actions\n' "$_GH_REPO"
-      exit 1
-    fi
-    sleep 15; _ecr_elapsed=$(( _ecr_elapsed + 15 ))
-    printf '  ...%ds\n' "$_ecr_elapsed"
-  done
-fi
-printf '  Image %s found in ECR.\n' "$_DEPLOY_TAG"
+_ensure_ecr() {
+  SITE_BUCKET_NAME="${SITE_BUCKET_NAME:-aws-springboot-frontend-${ACCOUNT_ID}-${REGION}}"
 
-IMAGE_URI="${ACCOUNT_ID}.dkr.ecr.${REGION}.amazonaws.com/${ECR_REPO}:${_DEPLOY_TAG}"
+  echo ""
+  echo "[2/5] Provisioning ECR repository..."
+  aws ecr describe-repositories --repository-names "$ECR_REPO" --region "$REGION" >/dev/null 2>&1 || \
+    aws ecr create-repository --repository-name "$ECR_REPO" --region "$REGION" >/dev/null
+  printf '  ECR repo ready.\n'
+}
 
-echo ""
-echo "[4/5] Deploying backend..."
+_wait_for_image() {
+  echo ""
+  echo "[3/5] Verifying ECR image..."
+  _REMOTE_SHA="$(git -C "$ROOT_DIR" ls-remote origin HEAD 2>/dev/null | cut -c1-7)"
+  _DEPLOY_TAG="${_REMOTE_SHA:-$(git -C "$ROOT_DIR" rev-parse --short HEAD 2>/dev/null || echo "latest")}"
 
-API_HTTPS_URL=""
-ADMIN_API_URL=""
+  printf '  Checking ECR for image %s...\n' "$_DEPLOY_TAG"
+  if ! _ecr_image_exists "$_DEPLOY_TAG"; then
+    printf '  Waiting for GitHub Actions to build image %s (up to 15 min)...\n' "$_DEPLOY_TAG"
+    _ecr_elapsed=0
+    until _ecr_image_exists "$_DEPLOY_TAG"; do
+      if (( _ecr_elapsed >= 900 )); then
+        printf '  Timed out. Check Actions: https://github.com/%s/actions\n' "$_GH_REPO"
+        exit 1
+      fi
+      sleep 15; _ecr_elapsed=$(( _ecr_elapsed + 15 ))
+      printf '  ...%ds\n' "$_ecr_elapsed"
+    done
+  fi
+  printf '  Image %s found in ECR.\n' "$_DEPLOY_TAG"
 
-printf '\n'
-printf '  Option A — App Runner  (~$6/mo · 0.5 vCPU / 1 GB · DynamoDB + SQS included)\n'
-printf '  Deploy App Runner backend? [y/N]: '
-read -r _DEPLOY_AR
+  IMAGE_URI="${ACCOUNT_ID}.dkr.ecr.${REGION}.amazonaws.com/${ECR_REPO}:${_DEPLOY_TAG}"
+}
 
-printf '\n'
-printf '  Option B — Original showcase: ALB + ECS Fargate + Lambda start/stop\n'
-printf '  WARNING: ~$21/mo idle  (ALB $16.21 always-on + VPC IPs $4.53 + Fargate ~$6.80 when running)\n'
-printf '  Provision ALB + Fargate stack? [y/N]: '
-read -r _DEPLOY_ALB
+# ── Backend: App Runner ───────────────────────────────────────────────────────
 
-if [[ "${_DEPLOY_AR:-N}" =~ ^[Yy]$ && "${_DEPLOY_ALB:-N}" =~ ^[Yy]$ ]]; then
-  printf '  Both selected — App Runner takes precedence. Answer y to only one option.\n'
-  _DEPLOY_ALB=N
-fi
-
-if [[ "${_DEPLOY_AR:-N}" =~ ^[Yy]$ ]]; then
+_deploy_apprunner() {
   aws cloudformation deploy \
     --template-file "${ROOT_DIR}/artifacts/aws/apprunner.yaml" \
     --stack-name "${APPRUNNER_STACK}" \
@@ -104,8 +101,11 @@ if [[ "${_DEPLOY_AR:-N}" =~ ^[Yy]$ ]]; then
     aws apprunner start-deployment --service-arn "$_AR_ARN" --region "$REGION" >/dev/null 2>&1 || true
   fi
   printf '  App Runner live: %s\n' "$API_HTTPS_URL"
+}
 
-elif [[ "${_DEPLOY_ALB:-N}" =~ ^[Yy]$ ]]; then
+# ── Backend: ALB + ECS Fargate ────────────────────────────────────────────────
+
+_resolve_vpc() {
   if [[ -z "${VPC_ID:-}" || -z "${SUBNET_A:-}" || -z "${SUBNET_B:-}" ]]; then
     _STACK_PARAMS="$(aws cloudformation describe-stacks \
       --stack-name "$BACKEND_STACK" --region "$REGION" \
@@ -141,6 +141,10 @@ elif [[ "${_DEPLOY_ALB:-N}" =~ ^[Yy]$ ]]; then
   fi
 
   printf '  VPC: %s  Subnets: %s, %s\n' "$VPC_ID" "$SUBNET_A" "$SUBNET_B"
+}
+
+_deploy_alb_fargate() {
+  _resolve_vpc
 
   aws cloudformation deploy \
     --template-file "${ROOT_DIR}/artifacts/aws/infra.yaml" \
@@ -173,36 +177,76 @@ elif [[ "${_DEPLOY_ALB:-N}" =~ ^[Yy]$ ]]; then
   ADMIN_API_URL="$(aws cloudformation describe-stacks \
     --region "${REGION}" --stack-name "${ADMIN_STACK}" \
     --query "Stacks[0].Outputs[?OutputKey=='AdminApiUrl'].OutputValue" --output text)"
+}
 
-else
-  printf '  Skipping backend — frontend will deploy without API URL.\n'
-fi
+# ── Backend: menu ─────────────────────────────────────────────────────────────
 
-echo ""
-echo "[5/5] Deploying frontend (CloudFormation + S3 sync)..."
-aws cloudformation deploy \
-  --template-file "${ROOT_DIR}/artifacts/aws/frontend-infra.yaml" \
-  --stack-name "${FRONTEND_STACK}" \
-  --region "${REGION}" \
-  --parameter-overrides SiteBucketName="${SITE_BUCKET_NAME}"
+_deploy_backend() {
+  echo ""
+  echo "[4/5] Deploying backend..."
 
-DISTRIBUTION_ID="$(aws cloudformation describe-stacks \
-  --region "${REGION}" --stack-name "${FRONTEND_STACK}" \
-  --query "Stacks[0].Outputs[?OutputKey=='CloudFrontDistributionId'].OutputValue" --output text)"
+  printf '\n'
+  printf '  Option A — App Runner  (~$6/mo · 0.5 vCPU / 1 GB · DynamoDB + SQS included)\n'
+  printf '  Deploy App Runner backend? [y/N]: '
+  read -r _DEPLOY_AR
 
-FRONTEND_URL="$(aws cloudformation describe-stacks \
-  --region "${REGION}" --stack-name "${FRONTEND_STACK}" \
-  --query "Stacks[0].Outputs[?OutputKey=='FrontendUrl'].OutputValue" --output text)"
+  printf '\n'
+  printf '  Option B — Original showcase: ALB + ECS Fargate + Lambda start/stop\n'
+  printf '  WARNING: ~$21/mo idle  (ALB $16.21 always-on + VPC IPs $4.53 + Fargate ~$6.80 when running)\n'
+  printf '  Provision ALB + Fargate stack? [y/N]: '
+  read -r _DEPLOY_ALB
 
-ENV_FILE="${ROOT_DIR}/frontend/.env.production.local"
-trap 'rm -f "${ENV_FILE}"' EXIT
-printf 'VITE_API_BASE_URL=%s\nVITE_ADMIN_API_URL=%s\n' "${API_HTTPS_URL}" "${ADMIN_API_URL:-}" > "${ENV_FILE}"
-npm --prefix "${ROOT_DIR}/frontend" install
-npm --prefix "${ROOT_DIR}/frontend" run build
-aws s3 sync "${ROOT_DIR}/frontend/dist" "s3://${SITE_BUCKET_NAME}" --delete --region "${REGION}"
-aws cloudfront create-invalidation --distribution-id "${DISTRIBUTION_ID}" --paths "/*" >/dev/null
+  if [[ "${_DEPLOY_AR:-N}" =~ ^[Yy]$ && "${_DEPLOY_ALB:-N}" =~ ^[Yy]$ ]]; then
+    printf '  Both selected — App Runner takes precedence. Answer y to only one option.\n'
+    _DEPLOY_ALB=N
+  fi
 
-echo ""
-echo "[deploy] Done."
-printf '  API:      %s\n' "$API_HTTPS_URL"
-printf '  Frontend: %s\n' "$FRONTEND_URL"
+  if [[ "${_DEPLOY_AR:-N}" =~ ^[Yy]$ ]]; then
+    _deploy_apprunner
+  elif [[ "${_DEPLOY_ALB:-N}" =~ ^[Yy]$ ]]; then
+    _deploy_alb_fargate
+  else
+    printf '  Skipping backend — frontend will deploy without API URL.\n'
+  fi
+}
+
+# ── Frontend ──────────────────────────────────────────────────────────────────
+
+_deploy_frontend() {
+  echo ""
+  echo "[5/5] Deploying frontend (CloudFormation + S3 sync)..."
+  aws cloudformation deploy \
+    --template-file "${ROOT_DIR}/artifacts/aws/frontend-infra.yaml" \
+    --stack-name "${FRONTEND_STACK}" \
+    --region "${REGION}" \
+    --parameter-overrides SiteBucketName="${SITE_BUCKET_NAME}"
+
+  DISTRIBUTION_ID="$(aws cloudformation describe-stacks \
+    --region "${REGION}" --stack-name "${FRONTEND_STACK}" \
+    --query "Stacks[0].Outputs[?OutputKey=='CloudFrontDistributionId'].OutputValue" --output text)"
+
+  FRONTEND_URL="$(aws cloudformation describe-stacks \
+    --region "${REGION}" --stack-name "${FRONTEND_STACK}" \
+    --query "Stacks[0].Outputs[?OutputKey=='FrontendUrl'].OutputValue" --output text)"
+
+  local ENV_FILE="${ROOT_DIR}/frontend/.env.production.local"
+  trap 'rm -f "${ENV_FILE}"' EXIT
+  printf 'VITE_API_BASE_URL=%s\nVITE_ADMIN_API_URL=%s\n' "${API_HTTPS_URL}" "${ADMIN_API_URL:-}" > "${ENV_FILE}"
+  npm --prefix "${ROOT_DIR}/frontend" install
+  npm --prefix "${ROOT_DIR}/frontend" run build
+  aws s3 sync "${ROOT_DIR}/frontend/dist" "s3://${SITE_BUCKET_NAME}" --delete --region "${REGION}"
+  aws cloudfront create-invalidation --distribution-id "${DISTRIBUTION_ID}" --paths "/*" >/dev/null
+
+  echo ""
+  echo "[deploy] Done."
+  printf '  API:      %s\n' "$API_HTTPS_URL"
+  printf '  Frontend: %s\n' "$FRONTEND_URL"
+}
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+
+_check_credentials
+_ensure_ecr
+_wait_for_image
+_deploy_backend
+_deploy_frontend
